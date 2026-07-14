@@ -1,0 +1,159 @@
+name: 'PR Size'
+description: 'Scores PR complexity and flags oversized pull requests with a breakdown comment'
+author: 'iteebz'
+
+branding:
+  icon: 'git-pull-request'
+  color: 'orange'
+
+inputs:
+  github-token:
+    description: 'GitHub token for posting comments'
+    required: false
+    default: ${{ github.token }}
+  max-lines:
+    description: 'Line change threshold before flagging as large (default 400)'
+    required: false
+    default: '400'
+  max-files:
+    description: 'File count threshold before flagging as large (default 20)'
+    required: false
+    default: '20'
+  fail-on-large:
+    description: 'Fail the check if PR exceeds thresholds (default false)'
+    required: false
+    default: 'false'
+
+outputs:
+  lines-changed:
+    description: 'Total lines added + removed'
+    value: ${{ steps.size.outputs.lines_changed }}
+  files-changed:
+    description: 'Number of files changed'
+    value: ${{ steps.size.outputs.files_changed }}
+  size-label:
+    description: 'Size label: XS, S, M, L, XL, XXL'
+    value: ${{ steps.size.outputs.size_label }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Score PR size
+      id: size
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        MAX_LINES: ${{ inputs.max-lines }}
+        MAX_FILES: ${{ inputs.max-files }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        ADDITIONS=$(gh api repos/$REPO/pulls/$PR_NUMBER --jq '.additions')
+        DELETIONS=$(gh api repos/$REPO/pulls/$PR_NUMBER --jq '.deletions')
+        FILES=$(gh api repos/$REPO/pulls/$PR_NUMBER --jq '.changed_files')
+        LINES=$((ADDITIONS + DELETIONS))
+
+        echo "lines_changed=$LINES" >> "$GITHUB_OUTPUT"
+        echo "files_changed=$FILES" >> "$GITHUB_OUTPUT"
+
+        if [ "$LINES" -le 10 ]; then LABEL="XS"
+        elif [ "$LINES" -le 50 ]; then LABEL="S"
+        elif [ "$LINES" -le 150 ]; then LABEL="M"
+        elif [ "$LINES" -le 400 ]; then LABEL="L"
+        elif [ "$LINES" -le 800 ]; then LABEL="XL"
+        else LABEL="XXL"
+        fi
+        echo "size_label=$LABEL" >> "$GITHUB_OUTPUT"
+
+        if [ "$LINES" -le 50 ]; then LINE_SCORE=50
+        elif [ "$LINES" -le 150 ]; then LINE_SCORE=40
+        elif [ "$LINES" -le 400 ]; then LINE_SCORE=30
+        elif [ "$LINES" -le 800 ]; then LINE_SCORE=15
+        else LINE_SCORE=0
+        fi
+
+        if [ "$FILES" -le 3 ]; then FILE_SCORE=30
+        elif [ "$FILES" -le 10 ]; then FILE_SCORE=20
+        elif [ "$FILES" -le 20 ]; then FILE_SCORE=10
+        else FILE_SCORE=0
+        fi
+
+        if [ "$ADDITIONS" -gt 0 ] && [ "$DELETIONS" -gt 0 ]; then RATIO_BONUS=20
+        elif [ "$DELETIONS" -eq 0 ]; then RATIO_BONUS=10
+        else RATIO_BONUS=15
+        fi
+
+        SCORE=$((LINE_SCORE + FILE_SCORE + RATIO_BONUS))
+        [ "$SCORE" -gt 100 ] && SCORE=100
+
+        if [ "$SCORE" -ge 90 ]; then GRADE="A"
+        elif [ "$SCORE" -ge 80 ]; then GRADE="B+"
+        elif [ "$SCORE" -ge 70 ]; then GRADE="B"
+        elif [ "$SCORE" -ge 60 ]; then GRADE="C+"
+        elif [ "$SCORE" -ge 50 ]; then GRADE="C"
+        elif [ "$SCORE" -ge 40 ]; then GRADE="D"
+        else GRADE="F"
+        fi
+
+        case "$LABEL" in
+          XS|S) EMOJI="🟢" ;;
+          M)    EMOJI="🟡" ;;
+          L)    EMOJI="🟠" ;;
+          XL)   EMOJI="🔴" ;;
+          XXL)  EMOJI="🚨" ;;
+        esac
+
+        if [ "$LINES" -gt "$MAX_LINES" ] || [ "$FILES" -gt "$MAX_FILES" ]; then
+          OVER_THRESHOLD=true
+          if [ "$LINES" -gt "$MAX_LINES" ] && [ "$FILES" -gt "$MAX_FILES" ]; then
+            ADVICE="Exceeds both line ($MAX_LINES) and file ($MAX_FILES) thresholds. Consider splitting into smaller PRs."
+          elif [ "$LINES" -gt "$MAX_LINES" ]; then
+            ADVICE="Exceeds line threshold ($MAX_LINES). Large diffs are harder to review safely."
+          else
+            ADVICE="Touches $FILES files (threshold: $MAX_FILES). Fewer files per PR makes reviews faster."
+          fi
+        else
+          OVER_THRESHOLD=false
+          if [ "$SCORE" -ge 80 ]; then ADVICE="Tight and focused. Reviewers will thank you."
+          else ADVICE="Reasonable size. Watch file spread on future PRs."
+          fi
+        fi
+
+        {
+          echo "REPORT<<ENDOFREPORT"
+          echo "## $EMOJI PR Size: $LABEL ($SCORE/100 · $GRADE)"
+          echo ""
+          echo "| Metric | Value | Threshold |"
+          echo "|--------|-------|-----------|"
+          echo "| Lines changed | $LINES (+$ADDITIONS / -$DELETIONS) | $MAX_LINES |"
+          echo "| Files changed | $FILES | $MAX_FILES |"
+          echo ""
+          echo "$ADVICE"
+          echo "ENDOFREPORT"
+        } >> "$GITHUB_ENV"
+
+        echo "over_threshold=$OVER_THRESHOLD" >> "$GITHUB_OUTPUT"
+        echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+        echo "grade=$GRADE" >> "$GITHUB_OUTPUT"
+
+    - name: Post comment
+      if: github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        COMMENTS=$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+          --jq '.[] | select(.body | contains("PR Size:")) | .id')
+        for CID in $COMMENTS; do
+          gh api -X DELETE repos/${{ github.repository }}/issues/comments/$CID 2>/dev/null || true
+        done
+        gh pr comment ${{ github.event.pull_request.number }} \
+          --repo ${{ github.repository }} \
+          --body "$REPORT"
+
+    - name: Fail if over threshold
+      if: inputs.fail-on-large == 'true' && steps.size.outputs.over_threshold == 'true'
+      shell: bash
+      run: |
+        echo "::error::PR exceeds thresholds (lines: ${{ steps.size.outputs.lines_changed }}, files: ${{ steps.size.outputs.files_changed }})"
+        exit 1
